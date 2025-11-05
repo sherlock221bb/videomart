@@ -1,0 +1,475 @@
+import React, { useState, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, query, onSnapshot, serverTimestamp, addDoc } from 'firebase/firestore';
+import { LogOut, Home, Briefcase, Camera, User, ListPlus, Send } from 'lucide-react';
+
+// Firebase configuration - Replace with your actual config
+// For security, use environment variables in production
+const firebaseConfig = {
+  apiKey: process.env.REACT_APP_FIREBASE_API_KEY,
+  authDomain: process.env.REACT_APP_FIREBASE_AUTH_DOMAIN,
+  projectId: process.env.REACT_APP_FIREBASE_PROJECT_ID,
+  storageBucket: process.env.REACT_APP_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: process.env.REACT_APP_FIREBASE_MESSAGING_SENDER_ID,
+  appId: process.env.REACT_APP_FIREBASE_APP_ID
+};
+
+const appId = process.env.REACT_APP_APPLICATION_ID || 'default-app-id';
+
+// Helper function for exponential backoff retry logic
+const withRetry = async (fn, retries = 3, delay = 1000) => {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (i === retries - 1) throw error;
+      console.warn(`Attempt ${i + 1} failed. Retrying in ${delay}ms...`, error.message);
+      await new Promise(resolve => setTimeout(resolve, delay));
+      delay *= 2;
+    }
+  }
+};
+
+// Main App Component
+const App = () => {
+  const [db, setDb] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [view, setView] = useState('home');
+  const [projects, setProjects] = useState([]);
+  const [isPosting, setIsPosting] = useState(false);
+  const [snackbar, setSnackbar] = useState({ message: '', type: '' });
+
+  // Firebase Initialization and Authentication
+  useEffect(() => {
+    const initializeFirebase = async () => {
+      try {
+        const app = initializeApp(firebaseConfig);
+        const firestoreDb = getFirestore(app);
+        const firebaseAuth = getAuth(app);
+
+        setDb(firestoreDb);
+        setAuth(firebaseAuth);
+
+        // Authentication setup
+        await withRetry(async () => {
+          await signInAnonymously(firebaseAuth);
+        });
+
+        const unsubscribe = onAuthStateChanged(firebaseAuth, (user) => {
+          if (user) {
+            setUserId(user.uid);
+          } else {
+            setUserId(crypto.randomUUID());
+          }
+          setIsAuthReady(true);
+        });
+
+        return () => unsubscribe();
+      } catch (error) {
+        console.error("Firebase Initialization Error:", error);
+        setIsAuthReady(true);
+      }
+    };
+
+    initializeFirebase();
+  }, []);
+
+  // Real-time Project Data Listener
+  useEffect(() => {
+    if (!db || !isAuthReady) return;
+
+    const collectionPath = `/artifacts/${appId}/public/data/projects`;
+    const q = query(collection(db, collectionPath));
+
+    const unsubscribe = onSnapshot(q, 
+      (snapshot) => {
+        const fetchedProjects = snapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data(),
+          timestamp: doc.data().timestamp?.toDate().toLocaleDateString() || 'N/A'
+        }));
+        fetchedProjects.sort((a, b) => b.createdAt - a.createdAt);
+        setProjects(fetchedProjects);
+      }, 
+      (error) => {
+        console.error("Error listening to projects:", error);
+        setSnackbar({ message: 'Failed to load projects.', type: 'error' });
+      }
+    );
+
+    return () => unsubscribe();
+  }, [db, isAuthReady]);
+
+  // Post new project
+  const handlePostProject = async (projectData) => {
+    if (!db || !userId) {
+      setSnackbar({ message: 'Authentication not ready.', type: 'error' });
+      return;
+    }
+
+    setIsPosting(true);
+    try {
+      const collectionPath = `/artifacts/${appId}/public/data/projects`;
+      await withRetry(() => addDoc(collection(db, collectionPath), {
+        ...projectData,
+        posterId: userId,
+        status: 'Open',
+        createdAt: serverTimestamp(),
+      }));
+
+      setSnackbar({ message: 'Project posted successfully!', type: 'success' });
+      setView('browseProjects');
+    } catch (error) {
+      console.error("Error posting project:", error);
+      setSnackbar({ message: `Error: ${error.message}`, type: 'error' });
+    } finally {
+      setIsPosting(false);
+    }
+  };
+
+  // Snackbar Component
+  const Snackbar = ({ message, type }) => {
+    useEffect(() => {
+      if (message) {
+        const timer = setTimeout(() => setSnackbar({ message: '', type: '' }), 4000);
+        return () => clearTimeout(timer);
+      }
+    }, [message]);
+
+    if (!message) return null;
+
+    return (
+      <div className={`fixed bottom-5 right-5 p-4 rounded-lg shadow-xl text-white font-medium z-50 ${
+        type === 'success' ? 'bg-green-500' : 'bg-red-500'
+      }`}>
+        {message}
+      </div>
+    );
+  };
+
+  // Navigation Component
+  const NavButton = ({ icon: Icon, label, target, mobile = false }) => (
+    <button
+      onClick={() => setView(target)}
+      className={`flex items-center justify-center p-2 rounded-lg transition-colors duration-200 ${
+        view === target ? 'bg-indigo-600 text-white' : 'text-gray-300 hover:bg-gray-700 hover:text-white'
+      } ${mobile ? 'flex-col text-xs' : 'space-x-1 font-medium'}`}
+    >
+      <Icon className={`w-5 h-5 ${mobile ? 'mb-1' : 'mr-1'}`} />
+      <span className={mobile ? 'block' : 'hidden md:inline'}>{label}</span>
+    </button>
+  );
+
+  // Header Component
+  const Header = () => (
+    <header className="bg-gray-900 text-white shadow-lg sticky top-0 z-10">
+      <div className="container mx-auto px-4 py-3 flex justify-between items-center">
+        <div className="text-2xl font-bold tracking-tight flex items-center">
+          <Camera className="w-6 h-6 mr-2 text-indigo-400" />
+          VidiMatch
+        </div>
+        <nav className="hidden md:flex space-x-4">
+          <NavButton icon={Home} label="Home" target="home" />
+          <NavButton icon={ListPlus} label="Post Project" target="postProject" />
+          <NavButton icon={Briefcase} label="Browse Projects" target="browseProjects" />
+          <NavButton icon={User} label="My Profile" target="profile" />
+        </nav>
+        <div className="text-sm font-mono opacity-70 truncate max-w-xs">
+          User: {userId ? `${userId.substring(0, 4)}...${userId.substring(userId.length - 4)}` : 'Loading...'}
+        </div>
+      </div>
+      <nav className="md:hidden flex justify-around p-2 border-t border-gray-800">
+        <NavButton icon={Home} label="Home" target="home" mobile />
+        <NavButton icon={ListPlus} label="Post" target="postProject" mobile />
+        <NavButton icon={Briefcase} label="Browse" target="browseProjects" mobile />
+        <NavButton icon={User} label="Profile" target="profile" mobile />
+      </nav>
+    </header>
+  );
+
+  // View Components
+  const HomeView = () => (
+    <div className="p-8 space-y-8 max-w-4xl mx-auto">
+      <h1 className="text-4xl font-extrabold text-gray-900">
+        The Marketplace for Visual Storytellers
+      </h1>
+      <p className="text-gray-600 text-lg">
+        VidiMatch connects creative clients with professional videographers for ads, weddings, corporate videos, and more.
+      </p>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <Card
+          title="I Need a Videographer"
+          description="Post your project brief and budget. Get proposals from talented creators."
+          buttonText="Post a Project"
+          onClick={() => setView('postProject')}
+          icon={ListPlus}
+          color="bg-indigo-500"
+        />
+        <Card
+          title="I Am a Videographer"
+          description="Browse open projects, submit proposals, and build your portfolio."
+          buttonText="Browse Projects"
+          onClick={() => setView('browseProjects')}
+          icon={Briefcase}
+          color="bg-green-500"
+        />
+      </div>
+    </div>
+  );
+
+  const Card = ({ title, description, buttonText, onClick, icon: Icon, color }) => (
+    <div className="bg-white p-6 rounded-xl shadow-2xl border-t-4 border-b-4 border-indigo-200 transition-transform duration-300 hover:scale-[1.02]">
+      <div className="flex items-center mb-4">
+        <div className={`p-3 rounded-full text-white ${color}`}>
+          <Icon className="w-6 h-6" />
+        </div>
+        <h2 className="text-xl font-semibold ml-3 text-gray-800">{title}</h2>
+      </div>
+      <p className="text-gray-500 mb-6">{description}</p>
+      <button
+        onClick={onClick}
+        className="w-full bg-gray-900 text-white py-3 px-4 rounded-lg font-bold hover:bg-indigo-700 transition-colors duration-300 shadow-md"
+      >
+        {buttonText}
+      </button>
+    </div>
+  );
+
+  const PostProjectForm = () => {
+    const [formData, setFormData] = useState({
+      title: '',
+      description: '',
+      budget: '',
+      location: '',
+      type: 'Ad/Promo',
+    });
+
+    const handleChange = (e) => {
+      setFormData({ ...formData, [e.target.name]: e.target.value });
+    };
+
+    const handleSubmit = (e) => {
+      e.preventDefault();
+      if (!formData.title || !formData.description || !formData.budget) {
+        setSnackbar({ message: 'Please fill out all required fields.', type: 'error' });
+        return;
+      }
+      handlePostProject(formData);
+      setFormData({ title: '', description: '', budget: '', location: '', type: 'Ad/Promo' });
+    };
+
+    return (
+      <div className="p-8 max-w-3xl mx-auto">
+        <h1 className="text-3xl font-bold text-gray-900 mb-6">Post Your Project</h1>
+        <form onSubmit={handleSubmit} className="bg-white p-6 rounded-xl shadow-2xl space-y-6">
+          <div>
+            <label htmlFor="title" className="block text-sm font-medium text-gray-700">Project Title *</label>
+            <input
+              type="text"
+              name="title"
+              id="title"
+              value={formData.title}
+              onChange={handleChange}
+              required
+              className="mt-1 block w-full rounded-lg border-gray-300 border p-3 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+              placeholder="e.g., Short Ad for a Coffee Shop"
+            />
+          </div>
+
+          <div>
+            <label htmlFor="description" className="block text-sm font-medium text-gray-700">Description *</label>
+            <textarea
+              name="description"
+              id="description"
+              rows="5"
+              value={formData.description}
+              onChange={handleChange}
+              required
+              className="mt-1 block w-full rounded-lg border-gray-300 border p-3 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+              placeholder="Describe the scope, deliverables, and timeline."
+            />
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div>
+              <label htmlFor="budget" className="block text-sm font-medium text-gray-700">Budget ($) *</label>
+              <input
+                type="number"
+                name="budget"
+                id="budget"
+                value={formData.budget}
+                onChange={handleChange}
+                required
+                min="100"
+                className="mt-1 block w-full rounded-lg border-gray-300 border p-3 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                placeholder="Min. $100"
+              />
+            </div>
+
+            <div>
+              <label htmlFor="type" className="block text-sm font-medium text-gray-700">Project Type</label>
+              <select
+                name="type"
+                id="type"
+                value={formData.type}
+                onChange={handleChange}
+                className="mt-1 block w-full rounded-lg border-gray-300 border p-3 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 bg-white"
+              >
+                <option value="Ad/Promo">Ad/Promo</option>
+                <option value="Wedding">Wedding</option>
+                <option value="Corporate">Corporate</option>
+                <option value="Documentary">Documentary</option>
+                <option value="Other">Other</option>
+              </select>
+            </div>
+
+            <div>
+              <label htmlFor="location" className="block text-sm font-medium text-gray-700">Location</label>
+              <input
+                type="text"
+                name="location"
+                id="location"
+                value={formData.location}
+                onChange={handleChange}
+                className="mt-1 block w-full rounded-lg border-gray-300 border p-3 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                placeholder="e.g., London, Remote"
+              />
+            </div>
+          </div>
+
+          <button
+            type="submit"
+            disabled={isPosting}
+            className="w-full flex justify-center items-center bg-indigo-600 text-white py-3 px-4 rounded-lg font-bold text-lg hover:bg-indigo-700 transition-colors duration-300 shadow-xl disabled:bg-indigo-400"
+          >
+            <Send className="w-5 h-5 mr-2" />
+            {isPosting ? 'Posting...' : 'Submit Project'}
+          </button>
+        </form>
+      </div>
+    );
+  };
+
+  const ProjectCard = ({ project }) => (
+    <div className="bg-white p-6 rounded-xl shadow-lg border-l-8 border-indigo-500 transition-shadow duration-300 hover:shadow-2xl">
+      <div className="flex justify-between items-start mb-2">
+        <h3 className="text-2xl font-bold text-gray-800">{project.title}</h3>
+        <span className={`text-xs font-semibold px-3 py-1 rounded-full ${
+          project.status === 'Open' ? 'bg-green-100 text-green-800' : 'bg-gray-100 text-gray-800'
+        }`}>
+          {project.status}
+        </span>
+      </div>
+      <div className="flex space-x-4 text-sm text-gray-500 mb-4 border-b pb-4">
+        <div className="flex items-center">
+          <ListPlus className="w-4 h-4 mr-1 text-indigo-400" />
+          <span>{project.type || 'N/A'}</span>
+        </div>
+        <div className="flex items-center">
+          <User className="w-4 h-4 mr-1 text-indigo-400" />
+          <span>Poster: {project.posterId ? `${project.posterId.substring(0, 4)}...` : 'Unknown'}</span>
+        </div>
+        <div className="flex items-center">
+          <Home className="w-4 h-4 mr-1 text-indigo-400" />
+          <span>Location: {project.location || 'Flexible'}</span>
+        </div>
+      </div>
+
+      <p className="text-gray-700 mb-4">{project.description}</p>
+
+      <div className="flex justify-between items-end">
+        <span className="text-2xl font-extrabold text-indigo-600">
+          ${(project.budget || 0).toLocaleString()}
+        </span>
+        <button
+          className="bg-gray-900 text-white py-2 px-4 rounded-lg font-semibold hover:bg-indigo-700 transition-colors duration-300"
+          onClick={() => setSnackbar({ message: `Proposal feature coming soon for ${project.title}!`, type: 'success' })}
+        >
+          Submit Proposal
+        </button>
+      </div>
+    </div>
+  );
+
+  const BrowseProjectsView = () => (
+    <div className="p-8 max-w-5xl mx-auto">
+      <h1 className="text-3xl font-bold text-gray-900 mb-6">Open Projects ({projects.length})</h1>
+      <div className="grid grid-cols-1 gap-6">
+        {projects.length === 0 ? (
+          <div className="text-center p-12 bg-white rounded-xl shadow-inner text-gray-500">
+            <Briefcase className="w-10 h-10 mx-auto mb-4 text-indigo-400" />
+            <p className="font-semibold">No active projects found.</p>
+          </div>
+        ) : (
+          projects.map(project => (
+            <ProjectCard key={project.id} project={project} />
+          ))
+        )}
+      </div>
+    </div>
+  );
+
+  const ProfileView = () => (
+    <div className="p-8 max-w-2xl mx-auto">
+      <h1 className="text-3xl font-bold text-gray-900 mb-6">User Profile</h1>
+      <div className="bg-white p-6 rounded-xl shadow-2xl space-y-4">
+        <div className="flex items-center space-x-4 border-b pb-4">
+          <User className="w-12 h-12 p-2 bg-indigo-100 text-indigo-600 rounded-full" />
+          <div>
+            <p className="text-xl font-semibold text-gray-800">User ID:</p>
+            <p className="font-mono text-sm break-all">{userId || 'Loading...'}</p>
+          </div>
+        </div>
+        <p className="text-gray-700">
+          Profile management and portfolio features coming soon.
+        </p>
+      </div>
+    </div>
+  );
+
+  // Main Content Router
+  let Content;
+  switch (view) {
+    case 'home':
+      Content = <HomeView />;
+      break;
+    case 'postProject':
+      Content = <PostProjectForm />;
+      break;
+    case 'browseProjects':
+      Content = <BrowseProjectsView />;
+      break;
+    case 'profile':
+      Content = <ProfileView />;
+      break;
+    default:
+      Content = <HomeView />;
+  }
+
+  if (!isAuthReady) {
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-gray-50">
+        <div className="text-center p-8 bg-white rounded-xl shadow-2xl">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-500 mx-auto mb-4"></div>
+          <p className="text-lg font-semibold text-gray-700">Loading VidiMatch...</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50 font-[Inter]">
+      <Header />
+      <main className="pb-20 pt-4">
+        {Content}
+      </main>
+      <Snackbar message={snackbar.message} type={snackbar.type} />
+    </div>
+  );
+};
+
+export default App;
